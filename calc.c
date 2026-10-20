@@ -176,6 +176,7 @@ static void next_token(Lexer *lx) {
 
 // AI (Claude): prompt "help me understand the parser for + and - and explain it" - Value, Parser, evaluation, output file.
 // AI (Claude): prompt "help me understand * and / with precedence and explain it" - apply(), parse_term().
+// AI (Claude): prompt "help me understand parentheses and explain it" - ( ) in parse_primary().
 //
 // A value is either an integer or a float. The type travels with the value so
 // each operation can decide, from its two operands, which arithmetic to use.
@@ -257,11 +258,15 @@ static Value apply(Parser *p, TokKind op, size_t op_pos, size_t rhs_pos, Value a
     return r;
 }
 
-// primary := NUMBER
+// Forward declaration: primary needs parse_expr for the inside of ( ),
+// and parse_expr is defined further down.
+static Value parse_expr(Parser *p);
+
+// primary := NUMBER | '(' expr ')'
 // Every "missing operand" error is caught here: whatever token sits where a
-// number must be (a second operator, an invalid character, the line's '\n',
-// or the end of the file) is reported at its own start, which is exactly the
-// position the task's table gives for each of those cases.
+// number or '(' must be (a second operator, an invalid character, a ')' as in
+// "2 * ()", the line's '\n', or the end of the file) is reported at its own
+// start, which is exactly the position the task's table gives for each case.
 static Value parse_primary(Parser *p) {
     Value v = { 0, 0, 0.0 };
     Token t = p->lx.tok;
@@ -271,6 +276,23 @@ static Value parse_primary(Parser *p) {
     } else if (t.kind == T_FLOAT) {
         v.is_float = 1;
         v.f = t.fval;
+        next_token(&p->lx);
+    } else if (t.kind == T_LPAREN) {
+        // Parentheses call back up to the LOWEST level (parse_expr), so the
+        // inside is a complete expression again: that recursion is what makes
+        // ( ) group and lets them nest (the task allows up to 1000 deep).
+        next_token(&p->lx);
+        v = parse_expr(p);
+        if (p->failed) {
+            return v;
+        }
+        // Missing ')': the token found instead is reported. When the line just
+        // ends, that token is the '\n' (or the end of the file), which is the
+        // position the task's table asks for.
+        if (p->lx.tok.kind != T_RPAREN) {
+            fail(p, p->lx.tok.pos);
+            return v;
+        }
         next_token(&p->lx);
     } else {
         fail(p, t.pos);
@@ -384,8 +406,10 @@ static int evaluate(char *src, size_t len, OutBuf *out, size_t *err_pos) {
         next_token(lx);
         Value v = parse_expr(&p);
         // A complete expression must be followed by the end of the line.
-        // Anything else (a number after a number, an invalid character, a ')'
-        // with no '(') is reported at that token: it is where parsing stopped.
+        // Anything else is reported at that token, because it is where parsing
+        // stopped: a number after a number, an invalid character, or an extra
+        // ')'. An extra ')' ends up here because every '(' already consumed
+        // its own ')' inside parse_primary, so a leftover one has no partner.
         if (!p.failed && lx->tok.kind != T_EOL && lx->tok.kind != T_END) {
             fail(&p, lx->tok.pos);
         }
