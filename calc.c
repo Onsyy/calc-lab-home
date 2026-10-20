@@ -175,6 +175,7 @@ static void next_token(Lexer *lx) {
 }
 
 // AI (Claude): prompt "help me understand the parser for + and - and explain it" - Value, Parser, evaluation, output file.
+// AI (Claude): prompt "help me understand * and / with precedence and explain it" - apply(), parse_term().
 //
 // A value is either an integer or a float. The type travels with the value so
 // each operation can decide, from its two operands, which arithmetic to use.
@@ -205,22 +206,53 @@ static double as_double(Value v) {
     return v.is_float ? v.f : (double)v.i;
 }
 
-// Applies one binary operator. op_pos is the operator's position, needed for
-// the "infinite or not a number" error, which the task reports at the operator.
+// Applies one binary operator. Two positions are passed in because the task
+// reports different errors at different places:
+//  - op_pos:  the operator, for a float result that is infinite or not a number;
+//  - rhs_pos: the start of the right operand, for division by zero
+//             (in "8 / (4 - 2 * 2)" that is the '(', not the last 2).
 // Integer vs float: if EITHER operand is a float the operation is done in
 // double (task: "7 / 2.0 is 3.5"); only int op int stays a long long.
-static Value apply(Parser *p, TokKind op, size_t op_pos, Value a, Value b) {
+static Value apply(Parser *p, TokKind op, size_t op_pos, size_t rhs_pos, Value a, Value b) {
     Value r = { 0, 0, 0.0 };
     if (a.is_float || b.is_float) {
         double x = as_double(a);
         double y = as_double(b);
         r.is_float = 1;
-        r.f = (op == T_PLUS) ? x + y : x - y;
+        switch (op) {
+        case T_PLUS:  r.f = x + y; break;
+        case T_MINUS: r.f = x - y; break;
+        case T_STAR:  r.f = x * y; break;
+        default:
+            // Float division by zero is an error too (1.5 / 0.0), even though
+            // C would quietly give inf, so it is checked before dividing.
+            if (y == 0.0) {
+                fail(p, rhs_pos);
+                return r;
+            }
+            r.f = x / y;
+            break;
+        }
         if (!isfinite(r.f)) {
             fail(p, op_pos);
         }
     } else {
-        r.i = (op == T_PLUS) ? a.i + b.i : a.i - b.i;
+        switch (op) {
+        case T_PLUS:  r.i = a.i + b.i; break;
+        case T_MINUS: r.i = a.i - b.i; break;
+        case T_STAR:  r.i = a.i * b.i; break;
+        default:
+            // Integer division by zero is undefined behaviour in C, so it must
+            // be caught before the '/' runs, not after.
+            if (b.i == 0) {
+                fail(p, rhs_pos);
+                return r;
+            }
+            // C's '/' already truncates toward zero (7 / 2 == 3,
+            // -7 / 2 == -3), which is exactly what the task asks for.
+            r.i = a.i / b.i;
+            break;
+        }
     }
     return r;
 }
@@ -246,20 +278,46 @@ static Value parse_primary(Parser *p) {
     return v;
 }
 
-// expr := primary { ('+' | '-') primary }
-// The loop folds each new operand into `left` immediately, so 10 - 3 + 1 is
-// (10 - 3) + 1: left-associative, as the task requires for + and -.
-static Value parse_expr(Parser *p) {
+// Why this gives the right precedence: each precedence level is its own
+// function, and a lower level calls the higher one to get its operands.
+// parse_expr (+ -) gets its operands from parse_term (* /), so by the time
+// parse_expr sees a '+', any '*' or '/' next to it has already been evaluated:
+// 3 + 2 * 5 is 3 + (2 * 5).
+
+// term := primary { ('*' | '/') primary }
+// The loop folds each operand into `left` right away, which makes * and /
+// left-associative: 100 / 7 / 2 is (100 / 7) / 2.
+static Value parse_term(Parser *p) {
     Value left = parse_primary(p);
-    while (!p->failed && (p->lx.tok.kind == T_PLUS || p->lx.tok.kind == T_MINUS)) {
+    while (!p->failed && (p->lx.tok.kind == T_STAR || p->lx.tok.kind == T_SLASH)) {
         TokKind op = p->lx.tok.kind;
         size_t op_pos = p->lx.tok.pos;
         next_token(&p->lx);
+        size_t rhs_pos = p->lx.tok.pos;   // start of the right operand
         Value right = parse_primary(p);
         if (p->failed) {
             break;
         }
-        left = apply(p, op, op_pos, left, right);
+        left = apply(p, op, op_pos, rhs_pos, left, right);
+    }
+    return left;
+}
+
+// expr := term { ('+' | '-') term }
+// Same loop one level lower, so + and - are left-associative too:
+// 10 - 3 + 1 is (10 - 3) + 1.
+static Value parse_expr(Parser *p) {
+    Value left = parse_term(p);
+    while (!p->failed && (p->lx.tok.kind == T_PLUS || p->lx.tok.kind == T_MINUS)) {
+        TokKind op = p->lx.tok.kind;
+        size_t op_pos = p->lx.tok.pos;
+        next_token(&p->lx);
+        size_t rhs_pos = p->lx.tok.pos;
+        Value right = parse_term(p);
+        if (p->failed) {
+            break;
+        }
+        left = apply(p, op, op_pos, rhs_pos, left, right);
     }
     return left;
 }
