@@ -177,6 +177,7 @@ static void next_token(Lexer *lx) {
 // AI (Claude): prompt "help me understand the parser for + and - and explain it" - Value, Parser, evaluation, output file.
 // AI (Claude): prompt "help me understand * and / with precedence and explain it" - apply(), parse_term().
 // AI (Claude): prompt "help me understand parentheses and explain it" - ( ) in parse_primary().
+// AI (Claude): prompt "help me understand ** and explain it" - int_pow(), apply_pow(), parse_power().
 //
 // A value is either an integer or a float. The type travels with the value so
 // each operation can decide, from its two operands, which arithmetic to use.
@@ -258,6 +259,47 @@ static Value apply(Parser *p, TokKind op, size_t op_pos, size_t rhs_pos, Value a
     return r;
 }
 
+// Integer power by repeated squaring: O(log exp) multiplications, so even a
+// huge exponent (1 ** 1000000000) is instant. The base is only squared while
+// exponent bits remain, so it never grows past the size of the result itself.
+// exp == 0 skips the loop and gives 1, which covers x ** 0 and 0 ** 0.
+static long long int_pow(long long base, long long exp) {
+    long long result = 1;
+    while (exp > 0) {
+        if (exp & 1) {
+            result *= base;
+        }
+        exp >>= 1;
+        if (exp > 0) {
+            base *= base;
+        }
+    }
+    return result;
+}
+
+// Applies '**'. Positions, as the task's table wants them:
+//  - exp_pos: start of the exponent, for a negative integer exponent
+//             ("2 ** (1 - 2)" -> the '(');
+//  - op_pos:  the '**' itself, for a float result that is inf or NaN
+//             ("(0 - 8) ** 0.5" is NaN -> reported at the '**').
+// The negative-exponent error is only for int ** int: an integer cannot hold
+// 2 ** -1, but with a float involved the task wants pow() (0.5 ** (0 - 1) is 2).
+static Value apply_pow(Parser *p, size_t op_pos, size_t exp_pos, Value a, Value b) {
+    Value r = { 0, 0, 0.0 };
+    if (a.is_float || b.is_float) {
+        r.is_float = 1;
+        r.f = pow(as_double(a), as_double(b));
+        if (!isfinite(r.f)) {
+            fail(p, op_pos);
+        }
+    } else if (b.i < 0) {
+        fail(p, exp_pos);
+    } else {
+        r.i = int_pow(a.i, b.i);
+    }
+    return r;
+}
+
 // Forward declaration: primary needs parse_expr for the inside of ( ),
 // and parse_expr is defined further down.
 static Value parse_expr(Parser *p);
@@ -301,22 +343,42 @@ static Value parse_primary(Parser *p) {
 }
 
 // Why this gives the right precedence: each precedence level is its own
-// function, and a lower level calls the higher one to get its operands.
-// parse_expr (+ -) gets its operands from parse_term (* /), so by the time
-// parse_expr sees a '+', any '*' or '/' next to it has already been evaluated:
-// 3 + 2 * 5 is 3 + (2 * 5).
+// function, and a lower level calls the higher one to get its operands:
+// parse_expr (+ -) -> parse_term (* /) -> parse_power (**) -> parse_primary.
+// So by the time parse_expr sees a '+', every '*', '/' and '**' next to it has
+// already been evaluated: 2 * 3 ** 2 + 1 is (2 * (3 ** 2)) + 1.
 
-// term := primary { ('*' | '/') primary }
+// power := primary [ '**' power ]
+// Why ** is right-associative: after '**' this function calls ITSELF for the
+// right side, so everything to the right is evaluated first:
+// 2 ** 3 ** 2 groups as 2 ** (3 ** 2) == 512. (The * / and + - levels use a
+// loop instead, which folds to the left.)
+static Value parse_power(Parser *p) {
+    Value base = parse_primary(p);
+    if (p->failed || p->lx.tok.kind != T_POW) {
+        return base;
+    }
+    size_t op_pos = p->lx.tok.pos;
+    next_token(&p->lx);
+    size_t exp_pos = p->lx.tok.pos;   // start of the exponent
+    Value exp = parse_power(p);
+    if (p->failed) {
+        return base;
+    }
+    return apply_pow(p, op_pos, exp_pos, base, exp);
+}
+
+// term := power { ('*' | '/') power }
 // The loop folds each operand into `left` right away, which makes * and /
 // left-associative: 100 / 7 / 2 is (100 / 7) / 2.
 static Value parse_term(Parser *p) {
-    Value left = parse_primary(p);
+    Value left = parse_power(p);
     while (!p->failed && (p->lx.tok.kind == T_STAR || p->lx.tok.kind == T_SLASH)) {
         TokKind op = p->lx.tok.kind;
         size_t op_pos = p->lx.tok.pos;
         next_token(&p->lx);
         size_t rhs_pos = p->lx.tok.pos;   // start of the right operand
-        Value right = parse_primary(p);
+        Value right = parse_power(p);
         if (p->failed) {
             break;
         }
