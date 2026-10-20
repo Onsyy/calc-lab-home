@@ -4,6 +4,7 @@
 // Resources used: Claude (Anthropic) - helped with the task and the code, Github codespace copilot? autofill was used aswell
 
 #include <ctype.h>
+#include <dirent.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,6 +179,7 @@ static void next_token(Lexer *lx) {
 // AI (Claude): prompt "help me understand * and / with precedence and explain it" - apply(), parse_term().
 // AI (Claude): prompt "help me understand parentheses and explain it" - ( ) in parse_primary().
 // AI (Claude): prompt "help me understand ** and explain it" - int_pow(), apply_pow(), parse_power().
+// AI (Claude): prompt "help me understand the command line part and explain it" - base_name(), default_outdir(), process_dir(), main().
 //
 // A value is either an integer or a float. The type travels with the value so
 // each operation can decide, from its two operands, which arithmetic to use.
@@ -487,16 +489,37 @@ static int evaluate(char *src, size_t len, OutBuf *out, size_t *err_pos) {
     return 0;
 }
 
-// Builds "<outdir>/<base>_<name>_<lastname>_<id>.txt" where <base> is the input
-// file name without its folder and without ".txt". The folder part is cut off
-// because inputs come as paths like labs/task1.txt or ../in/a.txt.
-static char *output_path(const char *outdir, const char *input) {
-    const char *base = strrchr(input, '/');
-    base = (base != NULL) ? base + 1 : input;
-    size_t base_len = strlen(base);
-    if (base_len >= 4 && strcmp(base + base_len - 4, ".txt") == 0) {
-        base_len -= 4;
+// Finds the last part of a path: "labs/task1.txt" -> "task1.txt",
+// "../in" -> "in", "labs/" -> "labs". Inputs come as paths like ../in/a.txt,
+// but output names must only use the file or folder name itself. Trailing '/'
+// are skipped first so that "-d labs/" still gives "labs".
+// Returns a pointer into `path` and the length of that part in *len.
+static const char *base_name(const char *path, size_t *len) {
+    size_t end = strlen(path);
+    while (end > 1 && path[end - 1] == '/') {
+        end--;
     }
+    size_t start = end;
+    while (start > 0 && path[start - 1] != '/') {
+        start--;
+    }
+    *len = end - start;
+    return path + start;
+}
+
+// <input_base>: the name without its folder and without ".txt".
+static const char *input_base(const char *path, size_t *len) {
+    const char *base = base_name(path, len);
+    if (*len >= 4 && strncmp(base + *len - 4, ".txt", 4) == 0) {
+        *len -= 4;
+    }
+    return base;
+}
+
+// Builds "<outdir>/<base>_<name>_<lastname>_<id>.txt".
+static char *output_path(const char *outdir, const char *input) {
+    size_t base_len;
+    const char *base = input_base(input, &base_len);
     const char *suffix = "_" FIRST_NAME "_" LAST_NAME "_" STUDENT_ID ".txt";
     size_t size = strlen(outdir) + 1 + base_len + strlen(suffix) + 1;
     char *path = malloc(size);
@@ -504,6 +527,21 @@ static char *output_path(const char *outdir, const char *input) {
         snprintf(path, size, "%s/%.*s%s", outdir, (int)base_len, base, suffix);
     }
     return path;
+}
+
+// Builds the default output folder "<input_base>_<name>_<id>" (no last name,
+// as in the task's example task1_anna_221234). It goes in the current folder,
+// so only the base name is used, never the input's own folder.
+static char *default_outdir(const char *input) {
+    size_t base_len;
+    const char *base = input_base(input, &base_len);
+    const char *suffix = "_" FIRST_NAME "_" STUDENT_ID;
+    size_t size = base_len + strlen(suffix) + 1;
+    char *dir = malloc(size);
+    if (dir != NULL) {
+        snprintf(dir, size, "%.*s%s", (int)base_len, base, suffix);
+    }
+    return dir;
 }
 
 // Creates the output folder if it does not exist; an existing folder is fine
@@ -555,38 +593,109 @@ static int process_file(const char *input, const char *outdir) {
     return ok ? 0 : -1;
 }
 
+// Evaluates every *.txt file directly inside `dir`. Only regular files count:
+// stat() filters out subfolders (even one named "x.txt"), and readdir() never
+// goes into subfolders, so nested files are ignored as the task requires.
+// One bad file does not stop the others; the return value says whether all
+// of them worked.
+static int process_dir(const char *dir, const char *outdir) {
+    DIR *d = opendir(dir);
+    if (d == NULL) {
+        fprintf(stderr, "calc: cannot open folder '%s'\n", dir);
+        return -1;
+    }
+    int result = 0;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL) {
+        const char *name = entry->d_name;
+        size_t name_len = strlen(name);
+        if (name_len < 4 || strcmp(name + name_len - 4, ".txt") != 0) {
+            continue;
+        }
+        size_t size = strlen(dir) + 1 + name_len + 1;
+        char *path = malloc(size);
+        if (path == NULL) {
+            result = -1;
+            break;
+        }
+        snprintf(path, size, "%s/%s", dir, name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            if (process_file(path, outdir) != 0) {
+                result = -1;
+            }
+        }
+        free(path);
+    }
+    closedir(d);
+    return result;
+}
+
+// Command line: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]
+// Every way the command line can be wrong (no arguments, unknown option, an
+// option without its value, both a file and -d, or neither) prints a message
+// to stderr and exits non-zero, as section 4 requires.
 int main(int argc, char **argv) {
     const char *outdir = NULL;
+    const char *dir = NULL;
     const char *input = NULL;
     for (int k = 1; k < argc; k++) {
-        if (strcmp(argv[k], "-o") == 0 || strcmp(argv[k], "--output-dir") == 0) {
+        const char *arg = argv[k];
+        int is_o = strcmp(arg, "-o") == 0 || strcmp(arg, "--output-dir") == 0;
+        int is_d = strcmp(arg, "-d") == 0 || strcmp(arg, "--dir") == 0;
+        if (is_o || is_d) {
             if (k + 1 >= argc) {
-                fprintf(stderr, "calc: %s needs a folder\n", argv[k]);
+                fprintf(stderr, "calc: %s needs a folder\n", arg);
                 usage();
                 return EXIT_FAILURE;
             }
-            outdir = argv[++k];
-        } else if (argv[k][0] == '-') {
-            fprintf(stderr, "calc: unknown option '%s'\n", argv[k]);
+            if (is_o) {
+                outdir = argv[++k];
+            } else {
+                dir = argv[++k];
+            }
+        } else if (arg[0] == '-') {
+            fprintf(stderr, "calc: unknown option '%s'\n", arg);
             usage();
             return EXIT_FAILURE;
         } else if (input == NULL) {
-            input = argv[k];
+            input = arg;
         } else {
             fprintf(stderr, "calc: more than one input file\n");
             usage();
             return EXIT_FAILURE;
         }
     }
-    // No input is a usage error per section 4: message on stderr, non-zero exit.
-    if (input == NULL) {
+    if ((input == NULL) == (dir == NULL)) {
+        if (input != NULL) {
+            fprintf(stderr, "calc: give either an input file or -d DIR, not both\n");
+        }
         usage();
         return EXIT_FAILURE;
     }
-    // TEMPORARY (step 4): -d and the default output folder come in a later step.
-    if (outdir == NULL) {
-        fprintf(stderr, "calc: -o OUTDIR is required for now\n");
+    // A missing input is checked before anything is created, so a typo in the
+    // file or folder name does not leave an empty default output folder behind.
+    struct stat st;
+    if (dir != NULL && (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))) {
+        fprintf(stderr, "calc: '%s' is not a folder\n", dir);
         return EXIT_FAILURE;
     }
-    return process_file(input, outdir) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (input != NULL && (stat(input, &st) != 0 || !S_ISREG(st.st_mode))) {
+        fprintf(stderr, "calc: cannot read '%s'\n", input);
+        return EXIT_FAILURE;
+    }
+    // Without -o the folder is <input_base>_<name>_<id>, where <input_base> is
+    // the file name without .txt or, with -d, the folder's own name.
+    char *made = NULL;
+    if (outdir == NULL) {
+        made = default_outdir(input != NULL ? input : dir);
+        if (made == NULL) {
+            fprintf(stderr, "calc: out of memory\n");
+            return EXIT_FAILURE;
+        }
+        outdir = made;
+    }
+    int rc = (dir != NULL) ? process_dir(dir, outdir) : process_file(input, outdir);
+    free(made);
+    return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
