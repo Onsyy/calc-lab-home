@@ -16,8 +16,8 @@
 // Name parts are kept separate because the two output names use different subsets:
 // result file <base>_<name>_<lastname>_<id>.txt, default folder <base>_<name>_<id>.
 // Names are lowercase plain ASCII like the task's example (anna_berzina_221234);
-// the ID is kept exactly as issued. Macros instead of static variables so that
-// unused ones (until the CLI is written) do not trigger -Wall warnings.
+// the ID is kept exactly as issued. Macros, so they can be glued straight into
+// string literals like "_" FIRST_NAME "_" STUDENT_ID without building strings at runtime.
 #define FIRST_NAME "emils"
 #define LAST_NAME  "ozols"
 #define STUDENT_ID "251RDC076"
@@ -27,7 +27,10 @@ static void usage(void) {
             "usage: calc [-d DIR | --dir DIR] [-o OUTDIR | --output-dir OUTDIR] [input.txt]\n");
 }
 
-// The whole file is read into one buffer with a single fread
+// The whole file is read into one buffer with a single fread.
+// Large files: the size is known up front (fseek/ftell), so the buffer is
+// allocated once and the data is never copied or re-grown; the parser then
+// walks it with one index, so a multi-megabyte file costs one read and one pass.
 // "rb" so the bytes arrive exactly as stored and positions match the real file.
 // The extra byte holds a '\0' sentinel and keeps malloc(0) away for empty files.
 // Returns NULL on any failure; every path closes/frees what it opened.
@@ -580,7 +583,11 @@ static int process_file(const char *input, const char *outdir) {
     }
     char *path = (ensure_dir(outdir) == 0) ? output_path(outdir, input) : NULL;
     FILE *f = (path != NULL) ? fopen(path, "wb") : NULL;
-    int ok = f != NULL && fwrite(out.data, 1, out.len, f) == out.len;
+    // An input with no expressions (empty, or only blank/comment lines) gives an
+    // empty output file. out.data is still NULL then, and passing NULL to fwrite
+    // is undefined behaviour even with length 0 (the sanitizer reports it), so
+    // fwrite is only called when there is something to write.
+    int ok = f != NULL && (out.len == 0 || fwrite(out.data, 1, out.len, f) == out.len);
     // fclose can be where a write error first shows up, so its result counts too.
     if (f != NULL && fclose(f) != 0) {
         ok = 0;
