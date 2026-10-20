@@ -4,8 +4,11 @@
 // Resources used: Claude (Anthropic) - helped with the task and the code, Github codespace copilot? autofill was used aswell
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 
 // AI (Claude): prompt "explain this lab so i can understand in what order things should be done" - step 1, program skeleton.
 //
@@ -171,34 +174,275 @@ static void next_token(Lexer *lx) {
     lx->i++;
 }
 
+// AI (Claude): prompt "help me understand the parser for + and - and explain it" - Value, Parser, evaluation, output file.
+//
+// A value is either an integer or a float. The type travels with the value so
+// each operation can decide, from its two operands, which arithmetic to use.
+typedef struct {
+    int is_float;
+    long long i;
+    double f;
+} Value;
+
+// The parser owns the lexer and remembers the FIRST error only.
+// Why only the first: the task wants ERROR:<pos> for the first error in the
+// file, so once `failed` is set every parse function just returns, and no later
+// position can overwrite err_pos.
+typedef struct {
+    Lexer lx;
+    int failed;
+    size_t err_pos;   // 0-based, like token positions
+} Parser;
+
+static void fail(Parser *p, size_t pos) {
+    if (!p->failed) {
+        p->failed = 1;
+        p->err_pos = pos;
+    }
+}
+
+static double as_double(Value v) {
+    return v.is_float ? v.f : (double)v.i;
+}
+
+// Applies one binary operator. op_pos is the operator's position, needed for
+// the "infinite or not a number" error, which the task reports at the operator.
+// Integer vs float: if EITHER operand is a float the operation is done in
+// double (task: "7 / 2.0 is 3.5"); only int op int stays a long long.
+static Value apply(Parser *p, TokKind op, size_t op_pos, Value a, Value b) {
+    Value r = { 0, 0, 0.0 };
+    if (a.is_float || b.is_float) {
+        double x = as_double(a);
+        double y = as_double(b);
+        r.is_float = 1;
+        r.f = (op == T_PLUS) ? x + y : x - y;
+        if (!isfinite(r.f)) {
+            fail(p, op_pos);
+        }
+    } else {
+        r.i = (op == T_PLUS) ? a.i + b.i : a.i - b.i;
+    }
+    return r;
+}
+
+// primary := NUMBER
+// Every "missing operand" error is caught here: whatever token sits where a
+// number must be (a second operator, an invalid character, the line's '\n',
+// or the end of the file) is reported at its own start, which is exactly the
+// position the task's table gives for each of those cases.
+static Value parse_primary(Parser *p) {
+    Value v = { 0, 0, 0.0 };
+    Token t = p->lx.tok;
+    if (t.kind == T_INT) {
+        v.i = t.ival;
+        next_token(&p->lx);
+    } else if (t.kind == T_FLOAT) {
+        v.is_float = 1;
+        v.f = t.fval;
+        next_token(&p->lx);
+    } else {
+        fail(p, t.pos);
+    }
+    return v;
+}
+
+// expr := primary { ('+' | '-') primary }
+// The loop folds each new operand into `left` immediately, so 10 - 3 + 1 is
+// (10 - 3) + 1: left-associative, as the task requires for + and -.
+static Value parse_expr(Parser *p) {
+    Value left = parse_primary(p);
+    while (!p->failed && (p->lx.tok.kind == T_PLUS || p->lx.tok.kind == T_MINUS)) {
+        TokKind op = p->lx.tok.kind;
+        size_t op_pos = p->lx.tok.pos;
+        next_token(&p->lx);
+        Value right = parse_primary(p);
+        if (p->failed) {
+            break;
+        }
+        left = apply(p, op, op_pos, left, right);
+    }
+    return left;
+}
+
+// Output buffer that grows by doubling. Results are collected here instead of
+// being written straight to the file because one error anywhere means the
+// output must be ONLY ERROR:<pos>. Doubling keeps appends amortised O(1), so
+// millions of results are never copied over and over.
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+    int oom;          // set if realloc ever failed
+} OutBuf;
+
+static void out_append(OutBuf *o, const char *s, size_t n) {
+    if (o->oom) {
+        return;
+    }
+    if (o->len + n > o->cap) {
+        size_t cap = o->cap ? o->cap : 4096;
+        while (cap < o->len + n) {
+            cap *= 2;
+        }
+        char *grown = realloc(o->data, cap);
+        if (grown == NULL) {
+            o->oom = 1;
+            return;
+        }
+        o->data = grown;
+        o->cap = cap;
+    }
+    memcpy(o->data + o->len, s, n);
+    o->len += n;
+}
+
+// Evaluates every line of the file. Returns 1 and sets *err_pos (1-based) on
+// the first error, otherwise 0 with one result per expression in `out`.
+// Blank and comment lines are recognised here, before tokenizing, because only
+// the FIRST non-blank character decides it: '#' there makes a comment, while a
+// '#' anywhere later reaches the tokenizer and becomes an invalid character.
+static int evaluate(char *src, size_t len, OutBuf *out, size_t *err_pos) {
+    Parser p = { { src, len, 0, { T_END, 0, 0, 0.0 } }, 0, 0 };
+    Lexer *lx = &p.lx;
+    char num[64];
+    while (lx->i < len) {
+        size_t j = lx->i;
+        while (j < len && (src[j] == ' ' || src[j] == '\t')) {
+            j++;
+        }
+        if (j == len) {
+            break;                       // only spaces/tabs left: a blank last line
+        }
+        if (src[j] == '\n') {
+            lx->i = j + 1;               // blank line: no output
+            continue;
+        }
+        if (src[j] == '#') {             // comment line: skip through its '\n'
+            const char *nl = memchr(src + j, '\n', len - j);
+            lx->i = (nl != NULL) ? (size_t)(nl - src) + 1 : len;
+            continue;
+        }
+        lx->i = j;
+        next_token(lx);
+        Value v = parse_expr(&p);
+        // A complete expression must be followed by the end of the line.
+        // Anything else (a number after a number, an invalid character, a ')'
+        // with no '(') is reported at that token: it is where parsing stopped.
+        if (!p.failed && lx->tok.kind != T_EOL && lx->tok.kind != T_END) {
+            fail(&p, lx->tok.pos);
+        }
+        if (p.failed) {
+            *err_pos = p.err_pos + 1;
+            return 1;
+        }
+        int n = v.is_float ? snprintf(num, sizeof num, "%.15g\n", v.f)
+                           : snprintf(num, sizeof num, "%lld\n", v.i);
+        out_append(out, num, (size_t)n);
+        // After T_EOL the lexer index is already at the start of the next line.
+    }
+    return 0;
+}
+
+// Builds "<outdir>/<base>_<name>_<lastname>_<id>.txt" where <base> is the input
+// file name without its folder and without ".txt". The folder part is cut off
+// because inputs come as paths like labs/task1.txt or ../in/a.txt.
+static char *output_path(const char *outdir, const char *input) {
+    const char *base = strrchr(input, '/');
+    base = (base != NULL) ? base + 1 : input;
+    size_t base_len = strlen(base);
+    if (base_len >= 4 && strcmp(base + base_len - 4, ".txt") == 0) {
+        base_len -= 4;
+    }
+    const char *suffix = "_" FIRST_NAME "_" LAST_NAME "_" STUDENT_ID ".txt";
+    size_t size = strlen(outdir) + 1 + base_len + strlen(suffix) + 1;
+    char *path = malloc(size);
+    if (path != NULL) {
+        snprintf(path, size, "%s/%.*s%s", outdir, (int)base_len, base, suffix);
+    }
+    return path;
+}
+
+// Creates the output folder if it does not exist; an existing folder is fine
+// (the task says to write into it). Returns 0 on success.
+static int ensure_dir(const char *dir) {
+    struct stat st;
+    if (stat(dir, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? 0 : -1;
+    }
+    return mkdir(dir, 0777);
+}
+
+// Evaluates one input file and writes its result file into outdir.
+// Returns 0 on success. An ERROR:<pos> result is a success (exit code 0);
+// only an unreadable input or an unwritable output is a failure.
+static int process_file(const char *input, const char *outdir) {
+    size_t len;
+    char *text = read_file(input, &len);
+    if (text == NULL) {
+        fprintf(stderr, "calc: cannot read '%s'\n", input);
+        return -1;
+    }
+    OutBuf out = { NULL, 0, 0, 0 };
+    size_t err_pos = 0;
+    if (evaluate(text, len, &out, &err_pos)) {
+        char msg[64];
+        int n = snprintf(msg, sizeof msg, "ERROR:%zu\n", err_pos);
+        out.len = 0;                     // drop partial results
+        out_append(&out, msg, (size_t)n);
+    }
+    free(text);
+    if (out.oom) {
+        fprintf(stderr, "calc: out of memory\n");
+        free(out.data);
+        return -1;
+    }
+    char *path = (ensure_dir(outdir) == 0) ? output_path(outdir, input) : NULL;
+    FILE *f = (path != NULL) ? fopen(path, "wb") : NULL;
+    int ok = f != NULL && fwrite(out.data, 1, out.len, f) == out.len;
+    // fclose can be where a write error first shows up, so its result counts too.
+    if (f != NULL && fclose(f) != 0) {
+        ok = 0;
+    }
+    if (!ok) {
+        fprintf(stderr, "calc: cannot write output for '%s' into '%s'\n", input, outdir);
+    }
+    free(path);
+    free(out.data);
+    return ok ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
-    // No arguments is a usage error per section 4: message on stderr, non-zero exit.
-    if (argc < 2) {
+    const char *outdir = NULL;
+    const char *input = NULL;
+    for (int k = 1; k < argc; k++) {
+        if (strcmp(argv[k], "-o") == 0 || strcmp(argv[k], "--output-dir") == 0) {
+            if (k + 1 >= argc) {
+                fprintf(stderr, "calc: %s needs a folder\n", argv[k]);
+                usage();
+                return EXIT_FAILURE;
+            }
+            outdir = argv[++k];
+        } else if (argv[k][0] == '-') {
+            fprintf(stderr, "calc: unknown option '%s'\n", argv[k]);
+            usage();
+            return EXIT_FAILURE;
+        } else if (input == NULL) {
+            input = argv[k];
+        } else {
+            fprintf(stderr, "calc: more than one input file\n");
+            usage();
+            return EXIT_FAILURE;
+        }
+    }
+    // No input is a usage error per section 4: message on stderr, non-zero exit.
+    if (input == NULL) {
         usage();
         return EXIT_FAILURE;
     }
-    size_t len;
-    char *text = read_file(argv[1], &len);
-    if (text == NULL) {
-        fprintf(stderr, "calc: cannot read '%s'\n", argv[1]);
+    // TEMPORARY (step 4): -d and the default output folder come in a later step.
+    if (outdir == NULL) {
+        fprintf(stderr, "calc: -o OUTDIR is required for now\n");
         return EXIT_FAILURE;
     }
-    // TEMPORARY (step 3): print every token as "position kind [value]" so the
-    // tokenizer can be checked by hand against the task's examples.
-    static const char *names[] = {
-        "INT", "FLOAT", "+", "-", "*", "/", "**", "(", ")", "EOL", "END", "INVALID"
-    };
-    Lexer lx = { text, len, 0, { T_END, 0, 0, 0.0 } };
-    do {
-        next_token(&lx);
-        printf("%zu %s", lx.tok.pos + 1, names[lx.tok.kind]);
-        if (lx.tok.kind == T_INT) {
-            printf(" %lld", lx.tok.ival);
-        } else if (lx.tok.kind == T_FLOAT) {
-            printf(" %.15g", lx.tok.fval);
-        }
-        printf("\n");
-    } while (lx.tok.kind != T_END);
-    free(text);
-    return EXIT_SUCCESS;
+    return process_file(input, outdir) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
