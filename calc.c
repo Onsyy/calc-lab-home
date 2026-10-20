@@ -1,7 +1,7 @@
 // Emils Ozols 251RDC076
 // https://github.com/Onsyy/calc-lab-home
 // Compile with: gcc -O2 -Wall -Wextra -std=c17 -o calc calc.c -lm
-// Resources used: Claude (Anthropic) - helped with the task and the code, Github codespace copilot? autofill was used aswell
+// Resources used: Claude (Anthropic) - helped with the task and the code, Github codespace copilot?(I think it was called like that) autofill was used aswell
 
 #include <ctype.h>
 #include <dirent.h>
